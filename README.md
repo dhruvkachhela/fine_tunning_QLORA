@@ -13,16 +13,10 @@ Quantization maps continuous high-precision values (like 32-bit floats) to a dis
 ### The Gaussian Weight Distribution
 In deep neural networks, weights are not uniformly distributed. Instead, weight parameters closely follow a zero-centered normal (Gaussian) distribution, where the vast majority of weights cluster tightly around zero, with very few weights at the outer extremes.
 
-```
-       Uniform INT4 Spacing:  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-       
-                         * *
-                       *     *
-                     *         *
-                   *             *
-                  *               *
-       NF4 Spacing: || |  |   |    |      |      |       |       |      |      |    |   |  | ||
-```
+Naive uniform INT4 places its 16 bins at equal intervals across the full value range — e.g., roughly every 0.133 units between -1 and 1. NF4 instead places its 16 bins at the quantiles of a standard normal distribution: bins are packed close together near zero (e.g., consecutive values like -0.16, -0.08, 0.0, 0.09, 0.18) and spread far apart near the extremes (e.g., from 0.70 to 1.0 in one jump). This means NF4 spends its limited 4-bit resolution where the data actually is, rather than where it isn't.
+
+*(TODO: Generate a matplotlib plot comparing bin density (uniform vs. NF4 quantile spacing) and embed it here as an image.)*
+
 
 ### Quantile Quantization (NF4)
 * **Naive Uniform INT4** spaces its 16 quantization bins evenly across the range of the tensor. This is highly inefficient because it allocates the same representation capacity to the sparse tails of the distribution as it does to the dense center, leading to high quantization error where most of the weights reside.
