@@ -1,152 +1,201 @@
-# qlora-nl2sql: NF4 Quantization from Scratch
+# QLoRA From Scratch: NF4 Quantization & LoRA Injection on Qwen2.5-7B-Instruct
 
-This repository contains a manual, first-principles implementation of NormalFloat4 (NF4) quantization and dequantization built using PyTorch. This is a core component of a larger project designed to fine-tune a large language model (e.g., Qwen2.5-3B or similar) on the Spider text-to-SQL dataset using QLoRA. This project is a scaled-up successor to `nl2sql-lora`, which applied standard LoRA to a smaller Qwen2.5-0.5B model.
+[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-blue)](https://huggingface.co/thefounder03/qlora-nl2sql-qwen2.5-7b)
 
-To establish a deep, mechanical understanding of quantization before relying on pre-built libraries, this implementation was built entirely from scratch with no dependency on `bitsandbytes`.
-
----
-
-## 1. What is NF4 and Why it Beats Naive Uniform INT4
-
-Quantization maps continuous high-precision values (like 32-bit floats) to a discrete set of lower-bit representations (like 4-bit indices). 
-
-### The Gaussian Weight Distribution
-In deep neural networks, weights are not uniformly distributed. Instead, weight parameters closely follow a zero-centered normal (Gaussian) distribution, where the vast majority of weights cluster tightly around zero, with very few weights at the outer extremes.
-
-Naive uniform INT4 places its 16 bins at equal intervals across the full value range — e.g., roughly every 0.133 units between -1 and 1. NF4 instead places its 16 bins at the quantiles of a standard normal distribution: bins are packed close together near zero (e.g., consecutive values like -0.16, -0.08, 0.0, 0.09, 0.18) and spread far apart near the extremes (e.g., from 0.70 to 1.0 in one jump). This means NF4 spends its limited 4-bit resolution where the data actually is, rather than where it isn't.
-
-*(TODO: Generate a matplotlib plot comparing bin density (uniform vs. NF4 quantile spacing) and embed it here as an image.)*
-
-
-### Quantile Quantization (NF4)
-* **Naive Uniform INT4** spaces its 16 quantization bins evenly across the range of the tensor. This is highly inefficient because it allocates the same representation capacity to the sparse tails of the distribution as it does to the dense center, leading to high quantization error where most of the weights reside.
-* **NormalFloat4 (NF4)** optimizes for Gaussian data by placing its 16 quantization levels at the **quantiles** of a standard normal distribution $N(0, 1)$. This concentrates the precision (closer spacing between bins) around zero, where the bulk of the weights live, and spaces them wider apart at the extremes.
-
-### Asymmetric Codebook Structure
-The NF4 codebook uses a specific asymmetric layout consisting of exactly 16 values:
-* **8 negative values**
-* **1 exact zero**
-* **7 positive values**
-
-Having an **exact zero** in the codebook is critical. Zero-valued weights or activations are extremely common (e.g., due to ReLU, padding, or general sparsity), and any quantization error around zero can significantly alter the model's behavior and performance.
+This repository contains a PyTorch implementation of QLoRA (Quantized Low-Rank Adaptation) built from scratch—without relying on high-level wrappers like `peft` or `bitsandbytes`. The project demonstrates the mechanical implementation of 4-bit NormalFloat (NF4) quantization, 8-bit double quantization of scaling factors, and the injection of trainable low-rank adapters into a 7-billion parameter language model (`Qwen/Qwen2.5-7B-Instruct`), fine-tuned on the Spider text-to-SQL benchmark.
 
 ---
 
-## 2. Block-Wise Scaling
+## 1. Project Summary
 
-Because the standard normal quantiles are static, the NF4 codebook is defined once and normalized to the range $[-1, 1]$. To quantize arbitrary weight tensors, the tensors must be normalized to fit this range:
+The core objective of this project was to manually implement the mathematical components of QLoRA and apply them to a real-world, instruction-tuned LLM. The pipeline consists of the following components:
 
-1. **The Outlier Problem:** If we normalize a whole tensor using a single global scale factor (the absolute maximum value of the entire tensor), a single extreme outlier will compress all other normal weights into a tiny range near zero, ruining precision for the entire tensor.
-2. **Block-Wise Quantization:** To mitigate this, the tensor is flattened and partitioned into independent blocks of a fixed size (default `block_size=64`). 
-3. **Per-Block Scales:** For each block, we compute a local scale factor:
-   $$\text{scale} = \max(|x_i|)$$
-   Each block is normalized individually by its scale before finding the nearest codebook representation. The scale factor is saved as a 32-bit float alongside the 4-bit quantized indices.
+*   **NF4 Codebook Construction:** Mathematical generation of the 16 quantile-based values for a standard normal distribution, structured asymmetrically to represent zero exactly.
+*   **Block-Wise NF4 Quantization:** Splitting weights into blocks of 64 parameters, calculating the absolute maximum scale factor for each block, normalizing the weights, and mapping them to the nearest NF4 bin.
+*   **Double Quantization (DQ):** Normalizing block-level scales (float32) by subtracting their mean, grouping them into blocks of 256, and quantizing them to 8-bit integers via uniform affine quantization to minimize memory overhead.
+*   **Custom `QuantizedLinear` Layer:** A PyTorch module that stores weights in their compressed form (4-bit indices and 8-bit scale indices) and dequantizes them back to the active activation type (float16) on-the-fly during the forward pass.
+*   **LoRA Injection:** A custom wrapper that intercepts the linear layers (`q_proj` and `v_proj` across all 28 attention blocks), introducing trainable low-rank matrices $A$ (initialized via Kaiming uniform) and $B$ (initialized to zero) with rank $r=8$ and scaling factor $\alpha=16$.
+*   **Fine-Tuning:** End-to-end training of the adapter parameters on the Spider dataset for natural language to SQL translation.
 
 ---
 
-## 3. Implementation Summary
+## 2. Scope & Design Philosophy
 
-The quantization and dequantization functions are implemented with vectorized PyTorch operations, avoiding slow Python loops:
+This project was built as an educational codebase to develop a mechanical understanding of QLoRA's numerical boundaries. It is not intended to be a production-optimized library. 
 
-* **Codebook Construction:** Constructed using `scipy.stats.norm.ppf` (the percent point function / inverse cumulative distribution function) to find the precise theoretical normal quantiles, followed by normalizations.
-* **Block Reshaping:** Input tensors are flattened, padded to be divisible by the block size, and reshaped into blocks using `.view(-1, block_size)`.
-* **Nearest-Match Mapping:** Normal weights are matched to the closest NF4 codebook value using broadcasted distance computation (`(normalized.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()`) and finding the minimum index via `.argmin(dim=-1)`.
+### Scope Boundaries:
+*   **Memory Management:** Paged optimizers are not built from scratch; we utilize `bitsandbytes`' `PagedAdamW` directly. Re-implementing paged optimizers requires CUDA-level unified memory allocation, which lies outside the scope of this PyTorch-level implementation.
+*   **Performance:** Dequantization occurs on-the-fly in pure PyTorch/Python during the forward and backward passes. Without fused CUDA kernels (such as those in `bitsandbytes`), training throughput is lower. This was a deliberate tradeoff to preserve code clarity and readability.
 
-### Function Signatures
+---
 
-Below are the signatures for the primary functions:
+## 3. Verification of the Quantization Math
+
+Prior to model integration, the custom quantization modules were verified against naive linear quantization on synthetic tensors to evaluate numerical precision and memory compression.
+
+### Test 1: NF4 vs. Naive INT4 Quantization
+Tested on a large normal-distribution tensor ($1024 \times 1024$ dimensions, block size = 64):
+*   **NF4 Mean Squared Error (MSE):** `0.0000033853`
+*   **Naive INT4 Mean Squared Error (MSE):** `0.0000040374`
+*   **Precision Improvement:** **16.15% reduction in MSE** when using quantile-based NormalFloat over uniform spacing.
+*   **Weight Compression Ratio:** **7.11x** (4.19 MB float32 weight compressed to 0.59 MB of packed indices and scales).
+
+### Test 2: Double Quantization Scale Compression
+Tested on level-1 float32 scale factors (block size = 256):
+*   **Scale bit-width reduction:** Compressed from 32-bit floats to 8-bit integers, plus block-level float32 scale metrics.
+*   **Scale Memory Savings:** **74.6% reduction** in VRAM required for storing weight scales.
+
+---
+
+## 4. Fine-Tuning Progression
+
+Fine-tuning a 7B parameter model under manual quantization involved three distinct runs to identify and resolve convergence and alignment failures.
+
+### Run 1: Unstable Baseline (Schema-Blind)
+*   **Configuration:** Schema-blind prompt (only `db_id` provided), `max_length=256`.
+*   **Hyperparameters:** Learning rate = `2e-4`, no learning rate scheduler, no checkpoints saved during training.
+*   **Results:**
+    *   Training loss steadily decreased from `0.4663` to `0.3375`.
+    *   Validation loss reached a minimum of `0.4503` at step 400, after which it diverged, rising to `0.54 - 0.61` by step 1000.
+*   **Diagnosis:** The learning rate was too high for a 7B model under QLoRA, leading to overfitting. Because checkpointing was not implemented, the optimal model parameters at step 400 were lost.
+
+### Run 2: Stable Baseline (Schema-Blind)
+*   **Configuration:** Schema-blind prompt, `max_length=256`.
+*   **Hyperparameters:** Lowered learning rate to `1e-4`, linear warmup (10% of steps) and decay scheduler, validation checkpointing.
+*   **Results:**
+    *   Training loss converged stably without divergence.
+    *   Reached a best validation loss of **`0.4531` at step 850 / 1000**.
+*   **Performance:** Evaluated to produce a baseline exact match of **10.00%** on the validation subset. Because the model was never shown the database schema, it wrote syntactically correct SQL but hallucinated column/table mappings.
+
+### Run 3: Schema-Grounded Training (Active Checkpoint)
+*   **Configuration:** Joined schema metadata from `richardr1126/spider-schema`, formatted using ChatML, and expanded context length to `max_length=1024` to prevent SQL target truncation.
+*   **Hyperparameters:** Learning rate = `1e-4`, linear warmup/decay scheduler, validation checkpointing.
+*   **Results:**
+    *   The loss converged rapidly due to the schema context.
+    *   Reached a best validation loss of **`0.2434` at step 350 / 1000**.
+*   **Performance:** The **step 350 checkpoint** from this run was loaded for all final evaluation metrics in Section 6, achieving **44.00% quote-normalized exact match**.
+
+---
+
+## 5. The Schema-Grounding Failure & Fix
+
+The 10.00% exact match baseline in Run 2 was caused by prompt schema blindness. The model wrote SQL without knowing what columns existed.
+
+### The Grounding Fix
+1.  **Metadata Join:** We integrated the `richardr1126/spider-schema` dataset, matching on `db_id` to retrieve table schemas, data types, and foreign key relations.
+2.  **Context Expansion:** Schema details expanded prompt lengths. A token length audit of the training splits showed:
+    *   *Average length:* 381.8 tokens.
+    *   *95th percentile:* 814 tokens.
+    *   *99th percentile:* 2,344 tokens.
+    We set `max_length` to `1024` to avoid cutting off target queries. 164 of 7,000 training examples (oversized schemas like `baseball_1`) were filtered out of the dataset entirely, and 0 validation examples were dropped.
+3.  **ChatML Formatting:** We formatted the prompts with Qwen's ChatML template using the tokenizer's chat template processor:
 
 ```python
-import torch
-
-def make_nf4_codebook() -> torch.Tensor:
-    """
-    Builds the 16-value NF4 codebook: quantiles of a standard normal
-    distribution, asymmetric (8 negative, exact 0, 7 positive) so that
-    zero is exactly representable.
+def tokenize_example(example, tokenizer, max_length=1024):
+    schema_text = format_schema(example["db_id"])
+    prompt = build_prompt(example["question"], schema_text)
     
-    Returns:
-        torch.Tensor: Sorted NF4 codebook of shape (16,) normalized to [-1, 1].
-    """
+    messages = [{"role": "user", "content": prompt}]
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    answer_text = example["query"] + tokenizer.eos_token
 
-def quantize_nf4(
-    tensor: torch.Tensor, 
-    codebook: torch.Tensor, 
-    block_size: int = 64
-) -> tuple[torch.Tensor, torch.Tensor, torch.Size, int]:
-    """
-    Quantizes a float tensor to 4-bit NF4 indices, block-wise.
-    
-    Args:
-        tensor: The input float32 tensor to quantize.
-        codebook: The 16-value NF4 codebook tensor.
-        block_size: Number of elements per independent quantization block.
-        
-    Returns:
-        indices: uint8 tensor of shape (num_blocks, block_size) containing values 0-15.
-        scales: float32 tensor of shape (num_blocks,) containing the absmax scale for each block.
-        orig_shape: The original shape of the input tensor (needed for dequantization).
-        orig_numel: The original number of elements in the input tensor (needed for padding removal).
-    """
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    answer_ids = tokenizer(answer_text, add_special_tokens=False)["input_ids"]
 
-def dequantize_nf4(
-    indices: torch.Tensor, 
-    scales: torch.Tensor, 
-    codebook: torch.Tensor, 
-    orig_shape: torch.Size, 
-    orig_numel: int, 
-    block_size: int = 64
-) -> torch.Tensor:
-    """
-    Reconstructs the original float32 tensor from NF4 indices and block scales.
-    
-    Args:
-        indices: uint8 tensor containing NF4 codebook indices.
-        scales: float32 tensor containing per-block scale factors.
-        codebook: The 16-value NF4 codebook tensor.
-        orig_shape: The target shape of the reconstructed tensor.
-        orig_numel: The original element count before padding.
-        block_size: Number of elements per quantization block.
-        
-    Returns:
-        torch.Tensor: Reconstructed float32 tensor matching the original shape.
-    """
+    total_len = len(prompt_ids) + len(answer_ids)
+    if total_len > max_length:
+        return None
+
+    input_ids = prompt_ids + answer_ids
+    labels = [-100] * len(prompt_ids) + answer_ids
+
+    # Pad to max_length
+    pad_len = max_length - len(input_ids)
+    input_ids = input_ids + [tokenizer.pad_token_id] * pad_len
+    labels    = labels    + [-100] * pad_len
+
+    return {
+        "input_ids": torch.tensor(input_ids),
+        "labels":    torch.tensor(labels),
+        "total_len": total_len,
+    }
 ```
 
 ---
 
-## 4. Empirical Validation
+## 6. Evaluation Metrics
 
-We verified the implementation using two tests:
+We evaluated the final schema-grounded Run 3 (Step 350) checkpoint on a representative subset of 300 validation examples across three distinct strictness thresholds:
 
-### Small-Tensor Sanity Check
-* **Setup:** A $4 \times 8$ tensor (32 values) with a block size of 8.
-* **Result:** Reconstruction works correctly and maps block scales and indices properly. Due to the small sample size, statistical advantages of NF4 are not yet representative.
+| Metric | Normalization Rules | Score |
+| :--- | :--- | :--- |
+| **Raw Exact Match** | Character-for-character exact match (whitespace stripped) | **10.67%** (32 / 300) |
+| **Case/Space Normalized** | Lowercased, multiple spaces collapsed to one | **35.33%** (106 / 300) |
+| **Case/Space/Quote Normalized** | Casing and spacing collapsed; single and double quotes normalized | **44.00%** (132 / 300) |
 
-### Large-Tensor Benchmark
-* **Setup:** A $1024 \times 1024$ tensor ($1,048,576$ values) sampled from a Gaussian distribution $N(0, 0.02)$ to simulate a realistic weight matrix.
-* **Block Size:** 64
-* **Metrics:**
-  * **NF4 Mean Squared Error (MSE):** `0.0000033853`
-  * **Naive Uniform INT4 MSE:** `0.0000040374`
-  * **Reconstruction Accuracy:** **NF4 reduces MSE by 16.15%** compared to naive uniform INT4.
-* **Compression Performance:**
-  * **Original (fp32) size:** `4.19 MB`
-  * **Quantized packed size:** `0.59 MB` (calculated as 4-bit per-value indices + 32-bit float scale per block)
-  * **Compression Ratio:** **7.11x** compression
+*Important: These are three different scoring strictness levels calculated on the exact same set of predictions from the Run 3 (Step 350) checkpoint, not three different runs.*
+
+### Limitation of Exact-Match Metrics
+Exact match does not measure semantic equivalence. The model is penalized for structurally valid SQL queries that write a different but functionally equivalent logic.
+
+#### Failure Example 1 (Join vs. Subquery):
+*   **Gold :** `SELECT count(*) FROM student AS T1 JOIN has_pet AS T2 ON T1.stuid  =  T2.stuid WHERE T1.age  >  20`
+*   **Pred :** `SELECT count(*) FROM has_pet WHERE Stuid IN (SELECT Stuid FROM student WHERE age  >  20)`
+*   *Result:* Scored as **Incorrect** due to strict structural differences, despite returning identical records.
+
+#### Failure Example 2 (Generation Truncation on Complex Filter):
+*   **Gold :** `SELECT T1.fname ,  T1.age FROM student AS T1 JOIN has_pet AS T2 ON T1.stuid  =  T2.stuid JOIN pets AS T3 ON T3.petid  =  T2.petid WHERE T3.pettype  =  'dog' AND T1.stuid NOT IN (SELECT T1.stuid FROM student AS T1 JOIN has_pet AS T2 ON T1.stuid  =  T2.stuid JOIN pets AS T3 ON T3.petid  =  T2.petid WHERE T3.pettype  =  'cat')`
+*   **Pred :** `SELECT T1.fname ,  T1.age FROM student AS T1 JOIN has_pet AS T2 ON T1.stuid  =  T2.stuid JOIN pets AS T3 ON T2.petid  =  T3.petid WHERE`
+*   *Result:* Scored as **Incorrect** because the model generated query ran into generation token limits (`max_new_tokens=50`), cutting off prior to the target condition.
 
 ---
 
-## 5. First-Principles Implementation
+## 7. Error Analysis
 
-This implementation is a deliberate educational exercise. Instead of treating double quantization and block-wise scaling as black-box configurations inside `bitsandbytes`, implementing NF4 from scratch using standard PyTorch operations exposes the exact mathematical and storage mechanics underlying QLoRA. This step ensures complete transparency of the quantization pipeline before scaling up to LLM fine-tuning.
+An audit of the remaining 168 failed predictions (under Case/Space/Quote normalization) shows the following error distribution:
+
+| Error Category | Occurrences |
+| :--- | :--- |
+| **Column/Table Name Mismatch** | 56 |
+| **Redundant JOIN clause** | 32 |
+| **Minor syntax / alias / spacing differences** | 28 |
+| **Missing JOIN clause** | 22 |
+| **Missing LIMIT clause** | 15 |
+| **Redundant WHERE clause** | 12 |
+| **Missing ORDER BY clause** | 11 |
+| **Missing COUNT aggregation** | 9 |
+| **Missing EXCEPT clause** | 7 |
+| **Redundant MAX aggregation** | 6 |
+| **Missing GROUP BY clause** | 5 |
+| **Redundant GROUP BY clause** | 5 |
+| **Redundant MIN aggregation** | 4 |
+| **Missing WHERE clause** | 4 |
+| **Redundant COUNT aggregation** | 3 |
+| **Missing MIN aggregation** | 3 |
+| **Missing INTERSECT clause** | 3 |
+| **Redundant UNION clause** | 2 |
+| **Redundant EXCEPT clause** | 2 |
+| **Redundant INTERSECT clause** | 1 |
+| **Missing SUM aggregation** | 1 |
+| **Missing UNION clause** | 1 |
+| **Redundant SUM aggregation** | 1 |
 
 ---
 
-## 6. Next Steps
+## 8. Known Limitations
 
-To complete the full custom QLoRA pipeline, the next milestones are:
+*   **No Multi-Seed Averaging:** The performance metrics represent a single training run. Due to resource limits, we did not average over multiple random seeds to establish statistical variance.
+*   **Evaluation Set Size:** Evaluation was executed on a subset of 300 dev examples, not the full Spider dev dataset.
+*   **No Execution-Based Evaluation:** Accuracy is evaluated on text comparison, which does not account for execution equivalence (e.g. JOIN vs. subqueries). True execution accuracy is likely higher than the 44.00% text-normalized exact-match score.
+*   **Pure PyTorch Dequantization:** Dequantizing full weights in PyTorch during the forward pass limits execution speed compared to fused C++/CUDA kernels (e.g. `bitsandbytes`).
 
-1. **Double Quantization:** Compress the per-block FP32 scale factors themselves (e.g., quantizing 32-bit scale blocks to 8-bit floats with a second block size of 256) to yield further memory savings.
-2. **Paged Optimizers:** Integrate page-locked memory managers to handle spike memory states during backward passes and avoid Out-Of-Memory (OOM) errors.
-3. **Full QLoRA Fine-tuning:** Hook the custom quantized linear layers into a parameter-efficient fine-tuning loop targeting a Qwen2.5-3B model on the Spider text-to-SQL dataset.
+---
+
+## 9. Core Accomplishments
+
+This project successfully implemented and verified:
+1.  **NormalFloat (NF4) Quantization** from scratch with an MSE improvement of 16.15% over standard INT4.
+2.  **8-bit Double Quantization** of weight scales, reducing scale memory footprints by 74.6%.
+3.  **Low-Rank Adaptation (LoRA)** modules injected on top of the quantized weights of a 7B parameter base model.
+4.  **Instability Resolution** through linear warmup/decay scheduling.
+5.  **Schema Grounding Integration** leading to a 3.5x improvement in exact-match accuracy.
