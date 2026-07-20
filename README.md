@@ -24,7 +24,7 @@ The core objective of this project was to manually implement the mathematical co
 This project was built as an educational codebase to develop a mechanical understanding of QLoRA's numerical boundaries. It is not intended to be a production-optimized library. 
 
 ### Scope Boundaries:
-*   **Memory Management:** Paged optimizers are not built from scratch; we utilize `bitsandbytes`' `PagedAdamW` directly. Re-implementing paged optimizers requires CUDA-level unified memory allocation, which lies outside the scope of this PyTorch-level implementation.
+*   **Memory Management:** Paged optimizers are out of scope as they require CUDA-level unified memory allocation (`cudaMallocManaged`). Rather than using `bitsandbytes`' `PagedAdamW` wrapper, the training loop utilizes standard PyTorch `AdamW` combined with **gradient checkpointing** and a **gradient accumulation step of 2** to fit the model within VRAM limits.
 *   **Performance:** Dequantization occurs on-the-fly in pure PyTorch/Python during the forward and backward passes. Without fused CUDA kernels (such as those in `bitsandbytes`), training throughput is lower. This was a deliberate tradeoff to preserve code clarity and readability.
 
 ---
